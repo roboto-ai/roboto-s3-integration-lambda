@@ -1,0 +1,16 @@
+# IDEs
+.vscode
+.idea
+.pytest-env
+.run
+.DS_Store
+
+# Python
+**/*.egg-info
+**/.mypy_cache/
+**/.venv/
+**/__pycache__/
+**/.pytest_cache
+
+# Artifacts
+**/build/

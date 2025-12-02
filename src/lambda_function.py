@@ -1,5 +1,6 @@
 import os
 import roboto
+import urllib.parse
 
 from aws_lambda_powertools.utilities.data_classes import event_source
 from aws_lambda_powertools.utilities.data_classes.s3_event import S3Event, S3EventRecord
@@ -67,7 +68,11 @@ def handle_event_record(event_record: S3EventRecord, context: LambdaContext) -> 
     )
     logger.info(f"Got dataset {ds.dataset_id}, importing file to it")
 
-    s3_uri = f"s3://{event_record.s3.bucket.name}/{event_record.s3.get_object.key}"
+    # S3 event records URL encode special characters like '+' in keys. We're sending them as raw strings in a POST
+    # body which doesn't need to be URL encoded, so we need to decode them before sending to Roboto.
+    key = urllib.parse.unquote(event_record.s3.get_object.key)
+    s3_uri = f"s3://{event_record.s3.bucket.name}/{key}"
+
     roboto.File.import_one(
         dataset_id=ds.dataset_id,
         uri=s3_uri,
@@ -107,7 +112,7 @@ def infer_create_args_from_record(event_record: S3EventRecord, context: LambdaCo
         information for dataset creation and file import
     """
     create_dataset_args = RobotoCreateDatasetArgs(
-        description="This dataset was automatically created by the roboto-s3-integration-lambda. For more information, see https://github.com/roboto/roboto-s3-integration-lambda",
+        description="This dataset was automatically created by the roboto-s3-integration-lambda. For more information, see https://github.com/roboto-ai/roboto-s3-integration-lambda",
         device_id=None,
         metadata={
             "importer_aws_request_id": context.aws_request_id
@@ -117,12 +122,13 @@ def infer_create_args_from_record(event_record: S3EventRecord, context: LambdaCo
     )
 
     import_file_args = RobotoImportFileArgs(
-        description="This file was automatically imported by the roboto-s3-integration-lambda. For more information, see https://github.com/roboto/roboto-s3-integration-lambda",
+        description="This file was automatically imported by the roboto-s3-integration-lambda. For more information, see https://github.com/roboto-ai/roboto-s3-integration-lambda",
         device_id=None,
         metadata={
             "importer_aws_request_id": context.aws_request_id
         },
-        relative_path=event_record.s3.get_object.key,
+        # See comment in handle_event_record about need for URL decoding
+        relative_path=urllib.parse.unquote(event_record.s3.get_object.key),
         tags=None,
     )
 

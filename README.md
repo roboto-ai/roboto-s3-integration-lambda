@@ -68,6 +68,9 @@ aws lambda update-function-configuration \
 - `ROBOTO_API_KEY`: Your Roboto API key (required)
 - `ROBOTO_ORG_ID`: Your Roboto organization ID (optional, required if you're in multiple orgs)
 
+> [!NOTE]
+> For non-managed Roboto deployments, include a third environment variable: `ROBOTO_SERVICE_ENDPOINT` to point to your Roboto deployment's API endpoint. 
+
 ### 3. Configure S3 Event Trigger
 
 Add an S3 event notification to trigger the Lambda function:

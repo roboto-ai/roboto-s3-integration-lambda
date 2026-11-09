@@ -1,13 +1,17 @@
 import os
+import time
+import typing
 import roboto
 import urllib.parse
 
 from aws_lambda_powertools.utilities.data_classes import event_source
 from aws_lambda_powertools.utilities.data_classes.s3_event import S3Event, S3EventRecord
 from aws_lambda_powertools.utilities.typing import LambdaContext
+from roboto.exceptions import RobotoConflictException
+from roboto.experimental.sessions import CompletionPolicy, SessionDeclaration, SessionFile
 
 from roboto_s3_lambda.dataset_grouping import DatasetUniquenessQueries
-from roboto_s3_lambda.model import RobotoCreateDatasetArgs, RobotoImportFileArgs
+from roboto_s3_lambda.model import RobotoCreateDatasetArgs, RobotoImportFileArgs, RobotoSessionArgs
 from roboto_s3_lambda.logger import logger
 
 
@@ -48,7 +52,7 @@ def handle_event_record(event_record: S3EventRecord, context: LambdaContext) -> 
     """
     This function is responsible for processing a single S3 event record and importing the file into Roboto.
     """
-    create_dataset_args, import_file_args = infer_create_args_from_record(event_record, context)
+    create_dataset_args, import_file_args, session_args = infer_create_args_from_record(event_record, context)
 
     # This controls how we group files into datasets. The DatasetUniquenessQueries class provides
     # some common grouping queries, but you can provide your own if you're so inclined.
@@ -63,6 +67,7 @@ def handle_event_record(event_record: S3EventRecord, context: LambdaContext) -> 
         tags=create_dataset_args.tags,
         metadata=create_dataset_args.metadata,
         description=create_dataset_args.description,
+        name=create_dataset_args.name,
         device_id=create_dataset_args.device_id,
         create_device_if_missing=True,
         caller_org_id=ROBOTO_ORG_ID,
@@ -74,7 +79,7 @@ def handle_event_record(event_record: S3EventRecord, context: LambdaContext) -> 
     key = urllib.parse.unquote(event_record.s3.get_object.key)
     s3_uri = f"s3://{event_record.s3.bucket.name}/{key}"
 
-    roboto.File.import_one(
+    file = roboto.File.import_one(
         dataset_id=ds.dataset_id,
         uri=s3_uri,
         relative_path=import_file_args.relative_path,
@@ -85,7 +90,47 @@ def handle_event_record(event_record: S3EventRecord, context: LambdaContext) -> 
     )
     logger.info(f"Successfully imported file {s3_uri} to dataset {ds.dataset_id}")
 
-def infer_create_args_from_record(event_record: S3EventRecord, context: LambdaContext) -> tuple[RobotoCreateDatasetArgs, RobotoImportFileArgs]:
+    if session_args is not None:
+        if create_dataset_args.device_id is None:
+            raise ValueError("Adding a file to a session needs RobotoCreateDatasetArgs.device_id")
+        add_file_to_session(file.file_id, create_dataset_args.device_id, session_args)
+
+SESSION_WRITE_ATTEMPTS = 4
+
+def add_file_to_session(file_id: str, device_id: str, session_args: RobotoSessionArgs) -> None:
+    """
+    Adds the file to the device's session named `session_args.name`, creating the session for the first file.
+
+    Roboto takes a per-device lock before it looks up the session name, so invocations that import files of the same
+    session at the same moment still create exactly one session. Resending a file the session already holds does not
+    add it again, so a retried invocation is safe.
+    """
+    # A declared completion policy replaces the session's policy and restarts its inactivity countdown, as does each
+    # new file. Without one, the session keeps its policy (on a new session, the org's default, if the org has one).
+    # The policy is passed only when set, because the request body keeps every field passed to the constructor,
+    # even one passed as NotSet.
+    policy: dict[str, typing.Any] = {}
+    if session_args.inactivity_minutes is not None:
+        policy["completion_policy"] = CompletionPolicy(inactivity_minutes=session_args.inactivity_minutes)
+    declaration = SessionDeclaration(name=session_args.name, files=[SessionFile(file_id=file_id)], **policy)
+
+    device = roboto.Device.from_id(device_id, org_id=ROBOTO_ORG_ID)
+    for attempt in range(1, SESSION_WRITE_ATTEMPTS + 1):
+        try:
+            session = device.create_sessions([declaration]).single()
+            break
+        except RobotoConflictException:
+            # Roboto refuses a declaration with a conflict when something it was prepared against, such as the
+            # session, changed while it was being written; nothing is written and resending is the documented fix.
+            # The SDK's HTTP client already retries throttling and 5xx responses, so any other error propagates.
+            if attempt == SESSION_WRITE_ATTEMPTS:
+                raise
+            time.sleep(2**attempt)
+    logger.info(f"Added file {file_id} to session {session.session_id} ({session_args.name}) on device {device_id}")
+
+def infer_create_args_from_record(
+    event_record: S3EventRecord, context: LambdaContext
+) -> tuple[RobotoCreateDatasetArgs, RobotoImportFileArgs, RobotoSessionArgs | None]:
     """
     Extension point for users to customize dataset and file import behavior.
     
@@ -103,14 +148,18 @@ def infer_create_args_from_record(event_record: S3EventRecord, context: LambdaCo
     device_id, metadata.start_time, location, etc. from the S3 key scheme. Alternatively,
     you may need to examine x-amzn-meta headers, S3 object tags, or query your own
     databases for additional context.
-    
+
+    To group files into Sessions (e.g. one per robot run, even when a run's files arrive over hours), return
+    RobotoSessionArgs with your run identifier as its name and set a device_id on the dataset args. Return None to
+    import files without adding them to a session.
+
     Args:
         event_record: The S3 event record containing bucket, key, and other S3 metadata
         context: The Lambda context containing request ID and other execution info
-        
+
     Returns:
-        A tuple of (RobotoCreateDatasetArgs, RobotoImportFileArgs) with the extracted
-        information for dataset creation and file import
+        A tuple of (RobotoCreateDatasetArgs, RobotoImportFileArgs, RobotoSessionArgs | None) with the extracted
+        information for dataset creation, file import, and the session the file belongs to
     """
     create_dataset_args = RobotoCreateDatasetArgs(
         description="This dataset was automatically created by the roboto-s3-integration-lambda. For more information, see https://github.com/roboto-ai/roboto-s3-integration-lambda",
@@ -133,4 +182,8 @@ def infer_create_args_from_record(event_record: S3EventRecord, context: LambdaCo
         tags=None,
     )
 
-    return create_dataset_args, import_file_args
+    # For example, with keys like `<device_id>/<run_id>/<file>`:
+    #   session_args = RobotoSessionArgs(name=run_id, inactivity_minutes=360)
+    session_args = None
+
+    return create_dataset_args, import_file_args, session_args
